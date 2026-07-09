@@ -1,0 +1,8 @@
+{
+  "notionToken": "secret_여기에_Notion_Integration_토큰을_입력",
+  "databaseId": "여기에_32자리_데이터베이스_ID를_입력",
+  "titleProperty": "Name",
+  "locale": "ko-KR",
+  "notePrefix": "음성 메모:",
+  "notionVersion": "2022-06-28"
+}

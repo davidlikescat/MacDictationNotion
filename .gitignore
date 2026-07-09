@@ -1,0 +1,10 @@
+# Swift / SPM
+.build/
+*.xcodeproj
+.swiftpm/
+
+# Build output
+MacDictationNotion.app/
+
+# Local secrets — never commit your real token
+config.json
