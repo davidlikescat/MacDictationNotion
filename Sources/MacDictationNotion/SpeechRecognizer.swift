@@ -1,6 +1,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import MacDictationNotionCore
 
 enum RecognizerError: LocalizedError {
     case unavailable
@@ -10,18 +11,16 @@ enum RecognizerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unavailable:
-            return "음성 인식을 사용할 수 없습니다. (해당 언어가 준비되지 않았거나 마이크가 없음)"
+            return "Speech recognition unavailable. The selected language may not be ready or no microphone is connected."
         case .notAuthorized:
-            return "음성 인식/마이크 권한이 없습니다. 시스템 설정에서 허용해 주세요."
+            return "Microphone or speech recognition permission denied. Enable both in System Settings > Privacy & Security."
         case .audioEngineFailed(let error):
-            return "마이크 시작 실패: \(error.localizedDescription)"
+            return "Microphone failed to start: \(error.localizedDescription)"
         }
     }
 }
 
-/// Captures microphone audio and transcribes it with the on-device speech engine
-/// (the same technology that powers macOS Dictation — no external STT API, no cost).
-final class SpeechRecognizer {
+final class SpeechRecognizer: SpeechRecognizing {
     private let recognizer: SFSpeechRecognizer?
     private let audioEngine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
@@ -32,15 +31,13 @@ final class SpeechRecognizer {
     private var onFinal: ((String) -> Void)?
     private var completionFired = false
 
-    /// Live partial transcript callback (called on the main thread).
     var onPartial: ((String) -> Void)?
+    var onAudioLevel: ((Float) -> Void)?
 
     init(localeIdentifier: String) {
         recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
     }
 
-    /// Requests both Speech Recognition and Microphone permission, reporting the
-    /// combined result on the main thread.
     static func requestAuthorization(completion: @escaping (Bool) -> Void) {
         SFSpeechRecognizer.requestAuthorization { speechStatus in
             let speechOK = (speechStatus == .authorized)
@@ -58,16 +55,16 @@ final class SpeechRecognizer {
             throw RecognizerError.unavailable
         }
 
-        // Reset state for a fresh session.
         latestTranscript = ""
         completionFired = false
         onFinal = nil
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition {
-            request.requiresOnDeviceRecognition = true
-        }
+        // Do NOT force requiresOnDeviceRecognition.
+        // On-device mode fires isFinal on every pause, breaking multi-sentence sessions.
+        // Server-based recognition accumulates the full session into formattedString
+        // across pauses naturally, which is what we want.
         self.request = request
 
         let inputNode = audioEngine.inputNode
@@ -75,6 +72,7 @@ final class SpeechRecognizer {
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
             self?.request?.append(buffer)
+            self?.emitAudioLevel(from: buffer)
         }
 
         audioEngine.prepare()
@@ -90,17 +88,28 @@ final class SpeechRecognizer {
         task = recognizer.recognitionTask(with: request) { [weak self] result, error in
             guard let self = self else { return }
             if let result = result {
-                self.latestTranscript = result.bestTranscription.formattedString
-                if let onPartial = self.onPartial {
-                    DispatchQueue.main.async { onPartial(self.latestTranscript) }
-                }
+                let text = result.bestTranscription.formattedString
+                // Server STT occasionally delivers empty string on isFinal — keep last good value.
+                if !text.isEmpty { self.latestTranscript = text }
+                DispatchQueue.main.async { self.onPartial?(self.latestTranscript) }
                 if result.isFinal { self.fireFinal() }
             }
             if error != nil { self.fireFinal() }
         }
     }
 
-    /// Stops recording and delivers the finalized transcript on the main thread.
+    func cancelRecording() {
+        guard isRecording else { return }
+        isRecording = false
+        completionFired = true
+        onFinal = nil
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        request?.endAudio()
+        task?.cancel(); task = nil
+        request = nil
+    }
+
     func stopRecording(completion: @escaping (String) -> Void) {
         guard isRecording else {
             DispatchQueue.main.async { completion(self.latestTranscript) }
@@ -113,13 +122,11 @@ final class SpeechRecognizer {
         audioEngine.inputNode.removeTap(onBus: 0)
         request?.endAudio()
 
-        // Safety net: if a final result never arrives, deliver the latest transcript.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             self?.fireFinal()
         }
     }
 
-    /// Delivers the transcript exactly once, and only after `stopRecording` armed `onFinal`.
     private func fireFinal() {
         DispatchQueue.main.async {
             guard let handler = self.onFinal, !self.completionFired else { return }
@@ -131,9 +138,20 @@ final class SpeechRecognizer {
     }
 
     private func cleanup() {
-        task?.cancel()
-        task = nil
-        request = nil
-        onFinal = nil
+        task?.cancel(); task = nil
+        request = nil; onFinal = nil
+    }
+
+    private func emitAudioLevel(from buffer: AVAudioPCMBuffer) {
+        guard let data = buffer.floatChannelData?[0] else { return }
+        let frameCount = Int(buffer.frameLength)
+        guard frameCount > 0 else { return }
+        let sumSq = (0..<frameCount).reduce(Float(0)) { $0 + data[$1] * data[$1] }
+        let rms = sqrt(sumSq / Float(frameCount))
+        let db = 20.0 * log10(rms + 1e-9)
+        let normalized = Float(max(0.0, min(1.0, (Double(db) + 50.0) / 50.0)))
+        DispatchQueue.main.async { [weak self] in
+            self?.onAudioLevel?(normalized)
+        }
     }
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox (App Store 필수) -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- 외부 API 호출 (Notion API, Ollama) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- 마이크 (음성 인식) -->
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+
+    <!-- 음성 인식 -->
+    <key>com.apple.security.speech-recognition</key>
+    <true/>
+
+    <!-- 손쉬운 사용 — 전역 키 모니터링 -->
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.axserver</string>
+    </array>
+</dict>
+</plist>

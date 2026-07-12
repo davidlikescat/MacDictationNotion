@@ -1,42 +1,41 @@
 import AppKit
 import Network
+import MacDictationNotionCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    private enum State: Equatable {
-        case idle          // 대기 중
-        case recording     // 녹음 중
-        case sending       // 노션 전송 중
-        case notConfigured // 설정 필요
+    private enum AppState: Equatable {
+        case idle, recording, sending, notConfigured
     }
 
     private var statusItem: NSStatusItem!
-    private var settings: Settings?
     private let hotKey = HotKeyManager()
-    private var recognizer: SpeechRecognizer?
-    private var notion: NotionClient?
+    private var pipeline: DictationPipeline?
     private let offlineQueue = OfflineQueue()
-    private let netMonitor = NWPathMonitor()
-    private var isOnline = true
+    private let netMonitor   = NWPathMonitor()
+    private var isOnline     = true
+    private var settingsWindow: SettingsWindowController?
+    private let hud = RecordingHUDController()
 
-    private var state: State = .idle {
+    private var appState: AppState = .idle {
         didSet { DispatchQueue.main.async { self.refreshUI() } }
     }
 
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setupApplicationMenu()
         setupStatusItem()
         Notifier.requestAuthorization()
+        requestAccessibilityPermission()
         loadSettings()
         setupHotKey()
         startNetworkMonitor()
 
-        // Prompt for mic + speech permission up front so the first dictation is smooth.
         SpeechRecognizer.requestAuthorization { granted in
             if !granted {
-                Notifier.notify(title: "권한 필요",
-                                body: "시스템 설정 › 개인정보 보호 및 보안에서 ‘마이크’와 ‘음성 인식’을 허용해 주세요.")
+                Notifier.notify(title: "Permission required",
+                                body: "Enable Microphone and Speech Recognition in System Settings > Privacy & Security.")
             }
         }
     }
@@ -46,29 +45,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         netMonitor.cancel()
     }
 
+    // MARK: - Accessibility permission
+
+    private func requestAccessibilityPermission() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        let trusted = AXIsProcessTrustedWithOptions(opts as CFDictionary)
+        if !trusted {
+            Notifier.notify(
+                title: "Accessibility permission required",
+                body: "Go to System Settings > Privacy & Security > Accessibility and enable MacDictationNotion."
+            )
+        }
+    }
+
+    // MARK: - Application menu (enables ⌘V/⌘C/⌘X in text fields)
+
+    private func setupApplicationMenu() {
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit MacDictationNotion", action: #selector(quit), keyEquivalent: "q"))
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z"))
+        editMenu.addItem(.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut",       action: #selector(NSText.cut(_:)),      keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy",      action: #selector(NSText.copy(_:)),     keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste",     action: #selector(NSText.paste(_:)),    keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
     // MARK: - Settings
 
     private func loadSettings() {
         do {
             let loaded = try Settings.load()
             guard loaded.isValid else {
-                settings = nil
-                state = .notConfigured
-                Notifier.notify(title: "설정 필요",
-                                body: "config.json에 notionToken과 databaseId를 입력해 주세요.")
+                pipeline = nil
+                appState = .notConfigured
+                Notifier.notify(title: "Setup required",
+                                body: "Enter your notionToken and databaseId in config.json.")
                 return
             }
-            settings = loaded
-            recognizer = SpeechRecognizer(localeIdentifier: loaded.locale)
-            notion = NotionClient(settings: loaded)
-            state = .idle
-            flushQueue() // Retry anything left over from a previous session.
+
+            let recognizer = SpeechRecognizer(localeIdentifier: loaded.locale)
+            let refiner    = LLMRefiner(settings: loaded)
+            let client     = NotionClient(settings: loaded)
+            let p          = DictationPipeline(recognizer: recognizer, refiner: refiner, client: client)
+
+            p.onStateChange = { [weak self] state in
+                guard let self = self else { return }
+                switch state {
+                case .idle:      self.appState = .idle
+                case .recording: self.appState = .recording
+                case .refining, .sending: self.appState = .sending
+                }
+            }
+            p.onPartialTranscript = { [weak self] text in
+                self?.statusItem.button?.toolTip = "Recording: …\(text.suffix(40))"
+                self?.hud.updateTranscript(text)
+            }
+            p.onAudioLevel = { [weak self] level in
+                self?.hud.setAudioLevel(level)
+            }
+            p.onSuccess = { [weak self] text in
+                guard let self = self else { return }
+                self.hud.hide()
+                self.playSound("Glass")
+                Notifier.notify(title: "Sent to Notion", body: String(text.prefix(60)))
+                self.refreshUI()
+            }
+            p.onFailure = { [weak self] error in
+                guard let self = self else { return }
+                self.hud.hide()
+                switch error {
+                case .emptyTranscript:
+                    Notifier.notify(title: "Nothing recognized", body: "Please try again.")
+                case .recognizerError(let msg):
+                    Notifier.notify(title: "Dictation failed to start", body: msg)
+                case .notionError(let e):
+                    if e.isRetryable {
+                        Notifier.notify(title: "Offline — could not queue",
+                                        body: "Check your network connection.")
+                    } else {
+                        Notifier.notify(title: "Send failed", body: e.userMessage)
+                    }
+                }
+                self.refreshUI()
+            }
+
+            pipeline = p
+            hotKey.register(keyCode: UInt32(loaded.hotkeyKeyCode),
+                            modifiers: UInt32(loaded.hotkeyModifiers))
+            appState = .idle
+            flushQueue(settings: loaded)
         } catch {
-            settings = nil
-            state = .notConfigured
+            pipeline = nil
+            appState = .notConfigured
             Settings.ensureExampleExists()
-            Notifier.notify(title: "설정 파일 없음",
-                            body: "메뉴에서 ‘설정 파일 열기’를 눌러 config.json을 작성해 주세요.")
+            Notifier.notify(title: "No config found",
+                            body: "Open Preferences from the menu bar icon to set up MacDictationNotion.")
         }
     }
 
@@ -81,21 +166,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshUI() {
         guard let button = statusItem.button else { return }
-        let symbol: String
-        let tooltip: String
-        switch state {
+        let (symbol, tooltip): (String, String)
+        switch appState {
         case .idle:
-            symbol = "mic"; tooltip = "대기 중 — ⌘⇧D로 받아쓰기 시작"
+            symbol = "mic"; tooltip = "Ready"
         case .recording:
-            symbol = "mic.fill"; tooltip = "녹음 중 — ⌘⇧D로 종료 및 전송"
+            symbol = "mic.fill"; tooltip = "Recording — press hotkey again to stop"
         case .sending:
-            symbol = "arrow.up.circle"; tooltip = "노션으로 전송 중…"
+            symbol = "arrow.up.circle"; tooltip = "Sending..."
         case .notConfigured:
-            symbol = "exclamationmark.triangle"; tooltip = "설정 필요 — config.json을 작성하세요"
+            symbol = "exclamationmark.triangle"; tooltip = "Setup required"
         }
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
         image?.isTemplate = true
-        button.image = image
+        button.image   = image
         button.toolTip = tooltip
         statusItem.menu = buildMenu()
     }
@@ -104,38 +188,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let toggleTitle = (state == .recording) ? "받아쓰기 중지 (⌘⇧D)" : "받아쓰기 시작 (⌘⇧D)"
-        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleFromMenu), keyEquivalent: "")
-        toggleItem.target = self
-        toggleItem.isEnabled = (state == .idle || state == .recording)
+        let toggleTitle = (appState == .recording) ? "Stop Dictation" : "Start Dictation"
+        let toggleItem  = NSMenuItem(title: toggleTitle, action: #selector(toggleFromMenu), keyEquivalent: "")
+        toggleItem.target    = self
+        toggleItem.isEnabled = (appState == .idle || appState == .recording)
         menu.addItem(toggleItem)
 
         menu.addItem(.separator())
 
         let pending = offlineQueue.count
-        let pendingItem = NSMenuItem(title: "재전송 대기: \(pending)건", action: nil, keyEquivalent: "")
+        let pendingItem = NSMenuItem(title: "Pending retry: \(pending)", action: nil, keyEquivalent: "")
         pendingItem.isEnabled = false
         menu.addItem(pendingItem)
 
-        if pending > 0 {
-            let retryItem = NSMenuItem(title: "지금 재전송", action: #selector(retryNow), keyEquivalent: "")
-            retryItem.target = self
-            menu.addItem(retryItem)
-        }
-
         menu.addItem(.separator())
 
-        let openItem = NSMenuItem(title: "설정 파일 열기", action: #selector(openConfig), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "Preferences...", action: #selector(openSettings), keyEquivalent: ",")
         openItem.target = self
         menu.addItem(openItem)
 
-        let reloadItem = NSMenuItem(title: "설정 다시 불러오기", action: #selector(reloadConfig), keyEquivalent: "")
+        let reloadItem = NSMenuItem(title: "Reload Settings", action: #selector(reloadConfig), keyEquivalent: "")
         reloadItem.target = self
         menu.addItem(reloadItem)
 
+        let howToItem = NSMenuItem(title: "How to Use...", action: #selector(openHowToUse), keyEquivalent: "")
+        howToItem.target = self
+        menu.addItem(howToItem)
+
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "종료", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -145,15 +227,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menu actions
 
     @objc private func toggleFromMenu() { toggleDictation() }
-    @objc private func retryNow() { flushQueue() }
 
-    @objc private func openConfig() {
-        let url = Settings.ensureExampleExists()
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            let wc = SettingsWindowController()
+            wc.onSave = { [weak self] in self?.loadSettings() }
+            settingsWindow = wc
+        }
+        settingsWindow?.showWindow(nil)
     }
 
     @objc private func reloadConfig() { loadSettings() }
     @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func openHowToUse() {
+        if let url = URL(string: "https://aicoder-lab.blogspot.com/2026/07/macdictationnotion-voice-notes-notion.html") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     // MARK: - Hot key
 
@@ -161,110 +251,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKey.onTrigger = { [weak self] in
             DispatchQueue.main.async { self?.toggleDictation() }
         }
-        hotKey.register()
     }
 
     // MARK: - Dictation flow
 
     private func toggleDictation() {
-        switch state {
+        switch appState {
         case .notConfigured:
-            Notifier.notify(title: "설정 필요", body: "config.json을 먼저 작성해 주세요.")
+            Notifier.notify(title: "Setup required", body: "Open Preferences to configure MacDictationNotion.")
         case .sending:
-            break // 전송 중에는 무시
+            break
         case .recording:
-            finishDictation()
+            hud.updateStatus("Sending...")
+            playSound("Pop")
+            pipeline?.stop()
         case .idle:
-            startDictation()
-        }
-    }
-
-    private func startDictation() {
-        guard let recognizer = recognizer else { return }
-        recognizer.onPartial = { [weak self] text in
-            self?.statusItem.button?.toolTip = "녹음 중: …\(text.suffix(40))"
-        }
-        do {
-            try recognizer.startRecording()
-            playSound("Tink")   // 시작을 알리는 '띵'
-            state = .recording
-        } catch {
-            let message = (error as? RecognizerError)?.errorDescription ?? error.localizedDescription
-            Notifier.notify(title: "받아쓰기 시작 실패", body: message)
-            state = .idle
-        }
-    }
-
-    private func finishDictation() {
-        guard let recognizer = recognizer else { return }
-        state = .sending
-        playSound("Pop")
-        recognizer.stopRecording { [weak self] text in
-            guard let self = self else { return }
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                Notifier.notify(title: "인식된 내용 없음", body: "다시 시도해 주세요.")
-                self.state = .idle
-                return
+            guard let pipeline = pipeline else { return }
+            hud.onCancel = { [weak self] in
+                self?.pipeline?.cancel()
+                self?.hud.hide()
+                self?.playSound("Pop")
             }
-            self.sendToNotion(trimmed)
-        }
-    }
-
-    private func sendToNotion(_ text: String) {
-        guard let notion = notion else {
-            offlineQueue.enqueue(text)
-            state = .idle
-            return
-        }
-        notion.send(text: text) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                switch result {
-                case .success:
-                    self.playSound("Glass")
-                    Notifier.notify(title: "노션 전송 완료 ✅", body: String(text.prefix(60)))
-                case .failure(let error):
-                    if error.isRetryable {
-                        self.offlineQueue.enqueue(text)
-                        Notifier.notify(title: "오프라인 — 임시 저장됨",
-                                        body: "네트워크 연결 시 자동으로 재전송합니다.")
-                    } else {
-                        Notifier.notify(title: "전송 실패 ❌", body: error.userMessage)
-                    }
-                }
-                self.state = .idle
+            do {
+                try pipeline.start()
+                playSound("Tink")
+                hud.show(hotkey: hotkeyLabel())
+            } catch {
+                let msg = (error as? RecognizerError)?.errorDescription ?? error.localizedDescription
+                Notifier.notify(title: "Dictation failed to start", body: msg)
             }
         }
     }
 
-    // MARK: - Offline queue flushing
+    // MARK: - Offline queue
 
-    private func flushQueue() {
-        guard let notion = notion else { refreshUI(); return }
+    private func flushQueue(settings: Settings) {
         let items = offlineQueue.load()
-        guard !items.isEmpty else { refreshUI(); return }
+        guard !items.isEmpty else { return }
+        let client = NotionClient(settings: settings)
 
         func sendNext(_ remaining: ArraySlice<OfflineQueue.Item>) {
             guard let first = remaining.first else {
                 DispatchQueue.main.async { self.refreshUI() }
                 return
             }
-            notion.send(text: first.text) { [weak self] result in
+            client.send(text: first.text) { [weak self] result in
                 guard let self = self else { return }
                 switch result {
                 case .success:
                     self.offlineQueue.remove(first)
-                    DispatchQueue.main.async { self.refreshUI() }
                     sendNext(remaining.dropFirst())
-                case .failure(let error):
-                    if error.isRetryable {
-                        // Still offline / server busy — stop and retry later.
-                        DispatchQueue.main.async { self.refreshUI() }
-                    } else {
-                        // Permanent failure (e.g. bad token): drop so it can't block the queue.
+                case .failure(let e):
+                    if !e.isRetryable {
                         self.offlineQueue.remove(first)
-                        DispatchQueue.main.async { self.refreshUI() }
                         sendNext(remaining.dropFirst())
                     }
                 }
@@ -281,13 +320,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let online = (path.status == .satisfied)
             DispatchQueue.main.async {
                 let wasOffline = !self.isOnline
-                self.isOnline = online
-                if online && wasOffline {
-                    self.flushQueue() // 네트워크 복구 시 자동 재전송
+                self.isOnline  = online
+                if online && wasOffline, let s = try? Settings.load(), s.isValid {
+                    self.flushQueue(settings: s)
                 }
             }
         }
         netMonitor.start(queue: DispatchQueue.global(qos: .utility))
+    }
+
+    // MARK: - Hotkey display
+
+    private func hotkeyLabel() -> String {
+        guard let s = try? Settings.load() else { return "단축키" }
+        let mod = UInt32(s.hotkeyModifiers)
+        var label = ""
+        if mod & 4096 != 0 { label += "⌃" }
+        if mod & 2048 != 0 { label += "⌥" }
+        if mod & 512  != 0 { label += "⇧" }
+        if mod & 256  != 0 { label += "⌘" }
+        let map: [UInt32: String] = [
+            0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",
+            11:"B",12:"Q",13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",
+            31:"O",32:"U",34:"I",35:"P",37:"L",38:"J",40:"K",45:"N",46:"M",49:"Space",
+        ]
+        label += map[UInt32(s.hotkeyKeyCode)] ?? "?"
+        return label
     }
 
     // MARK: - Sound
