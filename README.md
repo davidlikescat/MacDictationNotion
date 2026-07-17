@@ -1,102 +1,48 @@
 # MacDictationNotion
 
-A macOS menu bar app that sends voice notes directly to a Notion database — without leaving whatever you're working on.
+Dictate straight into Notion from anywhere on your Mac — using the on-device speech engine already built into macOS. No cloud STT API, no per-word cost, no audio leaving your machine.
 
-Press a hotkey from any app, say your note, press the same hotkey again. Done. The text lands in Notion in about five seconds.
+Press **⌘⇧D**, talk, press **⌘⇧D** again. A new page lands in your Notion database.
 
-Built entirely with [Claude Code](https://claude.ai/code).
+## Why
 
----
+I take a lot of quick notes into Notion, and typing them (especially on my phone) kills the thought before I finish it. Every "voice to Notion" tool I tried routed audio through a cloud speech API with a monthly bill. macOS already ships a perfectly good on-device dictation engine — the same one behind system Dictation — so I wired it straight to the Notion API instead.
 
 ## How it works
 
-1. Press the hotkey (default: `⌘1`, configurable)
-2. Speak — a floating HUD shows the live transcript as you talk
-3. Press the hotkey again to send, or ESC / X button to cancel
+| Step | What happens |
+|------|--------------|
+| Trigger | Global hotkey **⌘⇧D** (works in any app) |
+| Speech → text | macOS **Speech framework**, on-device (free, offline, same engine as system Dictation) |
+| Stop | Press **⌘⇧D** again → recognition ends and sends automatically |
+| Send | Notion REST API `POST /v1/pages` creates a new page |
+| Feedback | Menu bar icon state + native notification (success / failure) |
+| Offline | Caches the transcript locally and retries when the network is back |
 
-The note is created as a new page in your Notion database. If Notion is unreachable, the text queues locally and retries automatically when the connection returns.
-
-**Optional**: if you run [Ollama](https://ollama.com) locally, enable the LLM refinement option to clean up filler words before sending.
+Menu bar icon: idle · recording · sending · needs setup.
 
 ## Requirements
 
-- macOS 13 Ventura or later
-- A Notion workspace with an Integration token
-- Network connection (macOS Speech Recognition uses Apple's servers)
+- macOS 13 (Ventura) or later
+- Xcode Command Line Tools (`xcode-select --install`)
+- The dictation language you want added once in **System Settings › Keyboard › Dictation** (on-device recognition needs it downloaded)
 
-## Installation
+## Notion setup (5 min)
 
-1. Download `MacDictationNotion.dmg` from [Releases](../../releases)
-2. Open the DMG and copy the app to `/Applications`
-3. Clear the Gatekeeper flag (the app is not App Store signed):
-   ```bash
-   xattr -cr /Applications/MacDictationNotion.app
-   ```
-4. Launch the app
+1. **Create an integration** at https://www.notion.so/my-integrations → *New integration* (type: Internal). Copy the **Internal Integration Secret** (`secret_...` / `ntn_...`) → this is your `notionToken`.
+2. **Connect a database.** Prepare a Notion database, note its **Title property name** (default `Name`). On the database page: `···` › *Connections* › add the integration you just made. (Skipping this causes 403 / object-not-found errors.)
+3. **Get the Database ID.** Open the database in a browser — the 32-character value in the URL (no hyphens) is your `databaseId`.
 
-## Setup
+## Build
 
-### Notion side
+Copy the folder to your Mac, then build with the Swift toolchain. See the setup notes in the repo.
 
-1. Go to [notion.so/profile/integrations](https://www.notion.so/profile/integrations) and create a new internal integration. Copy the token (starts with `ntn_`).
-2. Open the target database in Notion. Click `...` → **Connections** → connect your integration.
-   > Easy to miss: without this step, the API returns "not found" even with a valid token.
-3. Get the database ID from the URL: `notion.so/.../{DATABASE-ID}?v=...`
+## Notes
 
-### App side
-
-Click the menu bar icon → **Preferences...**
-
-| Field | Description |
-|---|---|
-| Notion Token | Your `ntn_...` integration token |
-| Database ID | 32-character ID from the database URL |
-| Title property | Name of the title column (default: `Name`) |
-| Language | Locale for speech recognition (e.g. `en-US`, `ko-KR`) |
-| Prefix | Text prepended to each note (e.g. `Voice memo:`) |
-| Hotkey | Click the field and press your desired key combo |
-| LLM Refine | Optional Ollama cleanup pass before sending |
-
-Hit **Save** — settings apply immediately.
-
-**Permissions required on first launch:**
-- Microphone
-- Speech Recognition
-- Accessibility (System Settings → Privacy & Security → Accessibility) — needed for the global hotkey
-
-**Check your language model**: System Settings → Keyboard → Dictation → make sure your language is downloaded. If missing, the mic activates but no text appears.
-
-## Building from source
-
-Requires Xcode Command Line Tools (`xcode-select --install`).
-
-```bash
-git clone https://github.com/davidlikescat/MacDictationNotion
-cd MacDictationNotion
-swift build -c release
-cp -R .build/release/MacDictationNotion /Applications/MacDictationNotion.app/Contents/MacOS/MacDictationNotion
-```
-
-## Architecture
-
-```
-MacDictationNotionCore/        platform-independent library
-  Settings.swift               config load/save
-  DictationPipeline.swift      STT → LLM → Notion state machine
-  LLMRefiner.swift             Ollama /api/chat integration
-  NotionClient.swift           Notion REST API
-  OfflineQueue.swift           local retry queue
-
-MacDictationNotion/            macOS app target
-  AppDelegate.swift            menu bar, hotkey, pipeline wiring
-  SpeechRecognizer.swift       SFSpeechRecognizer + AVAudioEngine
-  RecordingHUDController.swift floating transcript panel
-  SettingsWindowController.swift
-  HotKeyManager.swift          Carbon RegisterEventHotKey
-```
-
-51 unit tests cover the pipeline, Notion client, LLM refiner, offline queue, and settings.
+- Native Swift, menu bar only, no third-party STT dependency.
+- Recognition quality varies by language — add and test your language in System Settings first.
+- The app is currently unsigned. On first launch, right click the app → **Open** to get past the Gatekeeper "unidentified developer" warning. Notarization is on the list.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
