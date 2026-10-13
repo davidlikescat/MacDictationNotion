@@ -46,3 +46,8 @@ Copy the folder to your Mac, then build with the Swift toolchain. See the setup 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Build log
+
+- [Build story (English)](https://aicoder-lab.blogspot.com/2026/07/macdictationnotion-voice-notes-notion.html)
+- [개발기 (Korean)](https://aicoder-lab.blogspot.com/2026/07/macos-dictation-notion-menubar.html)
